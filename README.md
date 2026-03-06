@@ -21,7 +21,7 @@ venv\Scripts\activate
 ```
 Install required packages
 ```bash
-pip install streamlit torch torchvision opencv-python pillow mediapipe
+pip install streamlit torch torchvision opencv-python pillow mediapipe==0.10.9
 ```
 
 ▶️ Run the Demo Application
