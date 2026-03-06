@@ -6,6 +6,9 @@ import cv2
 from PIL import Image
 import mediapipe as mp
 import numpy as np
+import av
+
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
 # ----------------------------
 # Device
@@ -13,17 +16,8 @@ import numpy as np
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ----------------------------
-# Load MediaPipe Face Mesh
+# Eye landmark indices
 # ----------------------------
-mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-
-# Eye landmark indices (MediaPipe)
 LEFT_EYE = [33, 133, 159, 145]
 RIGHT_EYE = [362, 263, 386, 374]
 
@@ -32,27 +26,31 @@ RIGHT_EYE = [362, 263, 386, 374]
 # ----------------------------
 @st.cache_resource
 def load_models():
-    # Eye model
+
     eye_model = models.mobilenet_v3_large(weights=None)
     eye_model.classifier[3] = nn.Linear(
         eye_model.classifier[3].in_features, 1
     )
+
     eye_model.load_state_dict(
         torch.load("models/mobilenetv3_eye_state.pth", map_location=device)
     )
+
     eye_model.eval().to(device)
 
-    # Mouth model
     mouth_model = models.mobilenet_v3_large(weights=None)
     mouth_model.classifier[3] = nn.Linear(
         mouth_model.classifier[3].in_features, 1
     )
+
     mouth_model.load_state_dict(
         torch.load("models/mobilenetv3_mouth_state.pth", map_location=device)
     )
+
     mouth_model.eval().to(device)
 
     return eye_model, mouth_model
+
 
 eye_model, mouth_model = load_models()
 
@@ -69,11 +67,14 @@ transform = transforms.Compose([
 ])
 
 # ----------------------------
-# Eye prediction (MediaPipe)
+# Eye prediction
 # ----------------------------
-def predict_eye_prob(model, frame):
+def predict_eye_prob(model, frame, mp_face_mesh):
+
     h, w, _ = frame.shape
+
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
     result = mp_face_mesh.process(rgb)
 
     if not result.multi_face_landmarks:
@@ -82,6 +83,7 @@ def predict_eye_prob(model, frame):
     landmarks = result.multi_face_landmarks[0].landmark
 
     def crop_eye(indices):
+
         xs = [int(landmarks[i].x * w) for i in indices]
         ys = [int(landmarks[i].y * h) for i in indices]
 
@@ -96,6 +98,7 @@ def predict_eye_prob(model, frame):
     probs = []
 
     for eye in [left_eye, right_eye]:
+
         if eye.size == 0:
             continue
 
@@ -112,9 +115,10 @@ def predict_eye_prob(model, frame):
     return sum(probs) / len(probs)
 
 # ----------------------------
-# Mouth prediction (full face)
+# Mouth prediction
 # ----------------------------
 def predict_mouth_prob(model, frame):
+
     img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     img = transform(img).unsqueeze(0).to(device)
 
@@ -129,7 +133,9 @@ def predict_mouth_prob(model, frame):
 EYE_THRESHOLD = 0.4
 MOUTH_THRESHOLD = 0.5
 
+
 def fuse_alertness(eye_prob, mouth_prob):
+
     eye_open = eye_prob > EYE_THRESHOLD
     mouth_yawn = mouth_prob > MOUTH_THRESHOLD
 
@@ -139,40 +145,70 @@ def fuse_alertness(eye_prob, mouth_prob):
         return "NOT ALERT"
 
 # ----------------------------
+# Video processor
+# ----------------------------
+class VideoProcessor(VideoProcessorBase):
+
+    def __init__(self):
+
+        self.frame_count = 0
+        self.last_status = "ALERT"
+
+        self.mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+
+    def recv(self, frame):
+
+        img = frame.to_ndarray(format="bgr24")
+
+        self.frame_count += 1
+
+        # Run ML every 3 frames
+        if self.frame_count % 3 == 0:
+
+            eye_prob = predict_eye_prob(
+                eye_model,
+                img,
+                self.mp_face_mesh
+            )
+
+            mouth_prob = predict_mouth_prob(
+                mouth_model,
+                img
+            )
+
+            self.last_status = fuse_alertness(
+                eye_prob,
+                mouth_prob
+            )
+
+        status = self.last_status
+
+        cv2.putText(
+            img,
+            f"Status: {status}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0) if status == "ALERT" else (0, 0, 255),
+            2
+        )
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+# ----------------------------
 # Streamlit UI
 # ----------------------------
-st.title("🚗 Driver Alertness Detection (MediaPipe Eye Cropping)")
+st.title("🚗 Driver Alertness Detection")
 st.markdown("**MobileNetV3 + Multi-Cue Fusion (Eye + Mouth)**")
 
-run = st.checkbox("Start Camera")
-
-frame_window = st.image([])
-status_text = st.empty()
-
-cap = None
-
-if run:
-    cap = cv2.VideoCapture(0)
-
-while run:
-    ret, frame = cap.read()
-    if not ret:
-        st.error("Camera not accessible")
-        break
-
-    eye_prob = predict_eye_prob(eye_model, frame)
-    mouth_prob = predict_mouth_prob(mouth_model, frame)
-
-    status = fuse_alertness(eye_prob, mouth_prob)
-
-    frame_window.image(frame, channels="BGR")
-    status_text.markdown(
-        f"""
-        ### 🧠 Status: **{status}**
-        - 👁 Eye open probability: `{eye_prob:.2f}`
-        - 👄 Yawn probability: `{mouth_prob:.2f}`
-        """
-    )
-
-if cap:
-    cap.release()
+webrtc_streamer(
+    key="driver-alertness",
+    video_processor_factory=VideoProcessor,
+    async_processing=True
+)
